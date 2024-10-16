@@ -119,4 +119,4 @@ class GPTModel(MegatronModule):
                 state_dict[self._word_embeddings_for_head_key], strict=strict)
         if self._language_model_key in state_dict:
             state_dict = state_dict[self._language_model_key]
-        self.language_model.load_state_dict(state_dict, strict=strict)
+        self.language_model.load_state_dict(state_dict, strict=False)

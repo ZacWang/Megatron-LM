@@ -423,7 +423,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         torch.distributed.barrier()
 
     end_misc = time()
-    logger.debug(f"rank: {torch.distributed.get_rank()}, takes {end_misc - start_misc} to finalize ckpt save ")
+    # logger.debug(f"rank: {torch.distributed.get_rank()}, takes {end_misc - start_misc} to finalize ckpt save ")
 
 def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                         rng_state, use_dist_ckpt=False, iteration=None,
@@ -441,6 +441,7 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                                model[0].state_dict_for_save_checkpoint())
     else:
         for i in range(len(model)):
+            print_rank_0(f"setting virtual pipeline rank {i}, use_dist_ckpt {use_dist_ckpt}")
             mpu.set_virtual_pipeline_model_parallel_rank(i)
             state_dict['model%d' % i] = (
                 model[i].sharded_state_dict()
@@ -743,7 +744,9 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     is_dist_ckpt = False
     if args.auto_detect_ckpt_format or args.use_dist_ckpt:
         state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=True, exit_on_missing_checkpoint=args.exit_on_missing_checkpoint)
+        print_rank_0(f"before check distributed ckpt, ckpt name: {checkpoint_name}, release: {release}")
         is_dist_ckpt = dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
+        print_rank_0(f"is_dist_ckpt: {is_dist_ckpt}")
         if is_dist_ckpt:
             ckpt_tp_pp = (state_dict['args'].tensor_model_parallel_size, state_dict['args'].pipeline_model_parallel_size)
             run_tp_pp = (mpu.get_tensor_model_parallel_world_size(), mpu.get_pipeline_model_parallel_world_size())
@@ -836,11 +839,11 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Model.
     strict = False if args.retro_add_retriever else strict
     if len(model) == 1:
-        model[0].load_state_dict(state_dict['model'], strict=strict)
+        model[0].load_state_dict(state_dict['model'], strict=False)
     else:
         for i in range(len(model)):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
-            model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
+            model[i].load_state_dict(state_dict['model%d' % i], strict=False)
 
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()

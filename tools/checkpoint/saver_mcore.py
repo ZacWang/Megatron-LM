@@ -278,6 +278,7 @@ def add_arguments(parser):
     group.add_argument('--target-pipeline-parallel-size', type=int,
                        help='Target tensor model parallel size, default to the pipeline parall size '
                        'in the input checkpoint if provided by the loader, otherwise to 1')
+    group.add_argument('--target-virtual-pipeline-parallel-size', type=int, help='', default=1)
     group.add_argument('--saver-transformer-impl', default='transformer_engine',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
@@ -366,6 +367,8 @@ def save_checkpoint(queue, args):
 
     # We want all arguments to come from us
     sys.argv = ['script.py',
+                '--use-dist-ckpt',
+                '--num-layers-per-virtual-pipeline-stage', str(int(md.num_layers) // (args.target_pipeline_parallel_size * args.target_virtual_pipeline_parallel_size)),
                 '--num-layers', str(md.num_layers),
                 '--hidden-size', str(md.hidden_size),
                 '--seq-length', str(md.seq_length),
@@ -484,9 +487,11 @@ def save_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
     mpu.set_expert_model_parallel_world_size(args.target_expert_parallel_size)
+    mpu.set_virtual_pipeline_model_parallel_world_size(args.target_virtual_pipeline_parallel_size)
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
     mpu.set_expert_model_parallel_rank(0)
+    mpu.set_virtual_pipeline_model_parallel_rank(0)
     fused_kernels.load(margs)
 
     # Embeddings
@@ -536,15 +541,25 @@ def save_checkpoint(queue, args):
     # Parameter setter class.
     setter = get_model_setter(md.model_type, margs.transformer_impl, margs.num_experts)
 
-    # Construct a 3D(PPxEPxTP) arry for models, fill it with None
-    models = [[[None for _ in range(args.target_tensor_parallel_size)] for _ in range(args.target_expert_parallel_size)] for _ in range(args.target_pipeline_parallel_size)]
+    # Construct a 4D(PPxVPxEPxTP) arry for models, fill it with None
+    # models[pp_rank][ep_rank][tp_rank][vp_rank]
+    models = [
+            [
+                [
+                    [
+                        None for _ in range(args.target_virtual_pipeline_parallel_size)
+                    ] for _ in range(args.target_tensor_parallel_size)
+                ] for _ in range(args.target_expert_parallel_size)
+            ] for _ in range(args.target_pipeline_parallel_size)
+        ]
 
     # Model is lazy instantiated at firstly using
     def get_local_model(pp_rank, ep_rank, tp_rank):
-        if models[pp_rank][ep_rank][tp_rank] is None:
-            pre_process = True if pp_rank == 0 else False
-            post_process = True if pp_rank == args.target_pipeline_parallel_size - 1 else False
-            models[pp_rank][ep_rank][tp_rank] = model_provider(pre_process, post_process).to(md.params_dtype)
+        if models[pp_rank][ep_rank][tp_rank][0] is None:
+            for vp_rank in range(args.target_virtual_pipeline_parallel_size):
+                pre_process = True if (pp_rank == 0) and (vp_rank == 0) else False
+                post_process = True if (pp_rank == args.target_pipeline_parallel_size - 1) and (vp_rank == args.target_virtual_pipeline_parallel_size -1) else False
+                models[pp_rank][ep_rank][tp_rank][vp_rank] = model_provider(pre_process, post_process).to(md.params_dtype)
         return models[pp_rank][ep_rank][tp_rank]
 
     # Set embeddings.
@@ -552,15 +567,17 @@ def save_checkpoint(queue, args):
     for ep_rank in range(args.target_expert_parallel_size):
         for tp_rank in range(args.target_tensor_parallel_size):
             model = get_local_model(0, ep_rank, tp_rank)
+            model_pp0_vp0 = model[0]
             if pos_embed is None:
-                assert not setter.has_position_embeddings(model)
+                assert not setter.has_position_embeddings(model_pp0_vp0)
             setter.set_embeddings(
-                model,
+                model_pp0_vp0,
                 word=out_word_embed[tp_rank],
                 pos=pos_embed,
             )
 
-    def chunk_weight(weight, parallel_mode, tp_size=1, ep_size=1):
+    def chunk_weight(weight, parallel_mode, tp_size=1, ep_size=1, name=""):
+        # print(f"name={name}, tp={tp_size},dim={weight.dim()},shape={weight.shape}")
         assert parallel_mode in ["row", "column"]
         if weight.dim() == 3:
             num_experts, out_features, in_features = weight.shape
@@ -601,196 +618,204 @@ def save_checkpoint(queue, args):
     for pp_rank in range(args.target_pipeline_parallel_size):
         # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
         get_local_model(pp_rank,0,0)
-        for layer_id in range(len(setter.get_transformer_block(models[pp_rank][0][0]).layers)):
-            msg = queue_get(f"transformer layer {total_layer_num}")
+        for vp_rank in range(args.target_virtual_pipeline_parallel_size):
+            print(f"parse layers for pp {pp_rank} vp {vp_rank} ...")
+            for layer_id in range(len(setter.get_transformer_block(models[pp_rank][0][0][vp_rank]).layers)):
+                msg = queue_get(f"transformer layer {total_layer_num}")
 
-            # duplicated tensors
-            input_norm_weight = msg.pop("input norm weight")
-            post_norm_weight = msg.pop("post norm weight")
-            if md.norm_has_bias:
-                input_norm_bias = msg.pop("input norm bias")
-                post_norm_bias = msg.pop("post norm bias")
+                # duplicated tensors
+                input_norm_weight = msg.pop("input norm weight")
+                post_norm_weight = msg.pop("post norm weight")
+                if md.norm_has_bias:
+                    input_norm_bias = msg.pop("input norm bias")
+                    post_norm_bias = msg.pop("post norm bias")
 
-            # Split up the parallel tensors
-            qkv_weight = chunk_weight(msg.pop("qkv weight"), "column", args.target_tensor_parallel_size)
-            dense_weight = chunk_weight(msg.pop("dense weight"), "row", args.target_tensor_parallel_size)
-            mlp_l1_weight = chunk_weight(msg.pop("mlp l1 weight"), "row", args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                # Split up the parallel tensors
+                qkv_weight = chunk_weight(msg.pop("qkv weight"), "column", args.target_tensor_parallel_size, "qkv weight")
+                dense_weight = chunk_weight(msg.pop("dense weight"), "row", args.target_tensor_parallel_size, "dense weight")
+                mlp_l1_weight = chunk_weight(msg.pop("mlp l1 weight"), "row", args.target_tensor_parallel_size, args.target_expert_parallel_size, "mlp l1 weight")
 
-            if margs.num_experts:
-                router = msg.pop("router weight")
+                if margs.num_experts:
+                    router = msg.pop("router weight")
 
-            # Special handling for swiglu
-            if md.swiglu:
-                mlp_l0_weight_W = chunk_weight(msg.pop("mlp l0 weight W"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
-                mlp_l0_weight_V = chunk_weight(msg.pop("mlp l0 weight V"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
-                mlp_l0_weight = torch.cat((mlp_l0_weight_W, mlp_l0_weight_V), dim=-2)
-            else:
-                mlp_l0_weight = chunk_weight(msg.pop("mlp l0 weight"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
-
-            if md.linear_bias:
-                dense_bias = msg.pop("dense bias")
-                mlp_l1_bias = chunk_bias(msg.pop("mlp l1 bias"), 'row', args.target_tensor_parallel_size, args.target_expert_parallel_size)
-                qkv_bias = chunk_bias(msg.pop("qkv bias"), 'column', args.target_tensor_parallel_size)
+                # Special handling for swiglu
                 if md.swiglu:
-                    mlp_l0_bias_W = chunk_bias(msg.pop("mlp l0 bias W"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
-                    mlp_l0_bias_V = chunk_bias(msg.pop("mlp l0 bias V"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
-                    mlp_l0_bias = torch.cat((mlp_l0_bias_W, mlp_l0_bias_V), dim=-1)
+                    mlp_l0_weight_W = chunk_weight(msg.pop("mlp l0 weight W"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                    mlp_l0_weight_V = chunk_weight(msg.pop("mlp l0 weight V"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                    mlp_l0_weight = torch.cat((mlp_l0_weight_W, mlp_l0_weight_V), dim=-2)
                 else:
-                    mlp_l0_bias = chunk_bias(msg.pop("mlp l0 bias"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                    mlp_l0_weight = chunk_weight(msg.pop("mlp l0 weight"), "column", args.target_tensor_parallel_size, args.target_expert_parallel_size)
 
-            # Save them to the model
-            for ep_rank in range(args.target_expert_parallel_size):
-                for tp_rank in range(args.target_tensor_parallel_size):
-                    params_dict = {
-                        "self_attn_norm_weight" : input_norm_weight,
-                        "self_attn_qkv_weight" : qkv_weight[tp_rank],
-                        "self_attn_proj_weight" : dense_weight[tp_rank],
-                        "mlp_norm_weight" : post_norm_weight
-                    }
-                    if margs.num_experts:
-                        params_dict.update({
-                            "mlp_fc1_weight" : mlp_l0_weight[ep_rank][tp_rank],
-                            "mlp_fc2_weight" : mlp_l1_weight[ep_rank][tp_rank]
-                        })
+                if md.linear_bias:
+                    dense_bias = msg.pop("dense bias")
+                    mlp_l1_bias = chunk_bias(msg.pop("mlp l1 bias"), 'row', args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                    qkv_bias = chunk_bias(msg.pop("qkv bias"), 'column', args.target_tensor_parallel_size)
+                    if md.swiglu:
+                        mlp_l0_bias_W = chunk_bias(msg.pop("mlp l0 bias W"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                        mlp_l0_bias_V = chunk_bias(msg.pop("mlp l0 bias V"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
+                        mlp_l0_bias = torch.cat((mlp_l0_bias_W, mlp_l0_bias_V), dim=-1)
                     else:
-                        params_dict.update({
-                            "mlp_fc1_weight" : mlp_l0_weight[tp_rank],
-                            "mlp_fc2_weight" : mlp_l1_weight[tp_rank]
-                        })
-                    params_dict.update({
-                        "self_attn_norm_bias" : input_norm_bias if md.norm_has_bias else None,
-                        "mlp_norm_bias" : post_norm_bias if md.norm_has_bias else None,
-                    })
-                    if md.linear_bias:
-                        params_dict.update({
-                            "self_attn_qkv_bias" : qkv_bias[tp_rank],
-                            "self_attn_proj_bias" : dense_bias
-                        })
+                        mlp_l0_bias = chunk_bias(msg.pop("mlp l0 bias"), 'column', args.target_tensor_parallel_size, args.target_expert_parallel_size)
+
+                # Save them to the model
+                for ep_rank in range(args.target_expert_parallel_size):
+                    for tp_rank in range(args.target_tensor_parallel_size):
+                        params_dict = {
+                            "self_attn_norm_weight" : input_norm_weight,
+                            "self_attn_qkv_weight" : qkv_weight[tp_rank],
+                            "self_attn_proj_weight" : dense_weight[tp_rank],
+                            "mlp_norm_weight" : post_norm_weight
+                        }
                         if margs.num_experts:
                             params_dict.update({
-                                "mlp_fc1_bias" : mlp_l0_bias[ep_rank][tp_rank],
-                                "mlp_fc2_bias" : mlp_l1_bias[ep_rank]
+                                "mlp_fc1_weight" : mlp_l0_weight[ep_rank][tp_rank],
+                                "mlp_fc2_weight" : mlp_l1_weight[ep_rank][tp_rank]
                             })
-                        else :
+                        else:
                             params_dict.update({
-                                "mlp_fc1_bias" : mlp_l0_bias[tp_rank],
-                                "mlp_fc2_bias" : mlp_l1_bias
+                                "mlp_fc1_weight" : mlp_l0_weight[tp_rank],
+                                "mlp_fc2_weight" : mlp_l1_weight[tp_rank]
                             })
-                    if margs.num_experts:
                         params_dict.update({
-                            "router_weight":  router
+                            "self_attn_norm_bias" : input_norm_bias if md.norm_has_bias else None,
+                            "mlp_norm_bias" : post_norm_bias if md.norm_has_bias else None,
                         })
-                    model = get_local_model(pp_rank, ep_rank, tp_rank)
-                    setter.set_layer(model, layer_id, **params_dict)
+                        if md.linear_bias:
+                            params_dict.update({
+                                "self_attn_qkv_bias" : qkv_bias[tp_rank],
+                                "self_attn_proj_bias" : dense_bias
+                            })
+                            if margs.num_experts:
+                                params_dict.update({
+                                    "mlp_fc1_bias" : mlp_l0_bias[ep_rank][tp_rank],
+                                    "mlp_fc2_bias" : mlp_l1_bias[ep_rank]
+                                })
+                            else :
+                                params_dict.update({
+                                    "mlp_fc1_bias" : mlp_l0_bias[tp_rank],
+                                    "mlp_fc2_bias" : mlp_l1_bias
+                                })
+                        if margs.num_experts:
+                            params_dict.update({
+                                "router_weight":  router
+                            })
+                        model = get_local_model(pp_rank, ep_rank, tp_rank)
+                        setter.set_layer(model[vp_rank], layer_id, **params_dict)
 
-            total_layer_num = total_layer_num + 1
-            check_message(msg)
+                total_layer_num = total_layer_num + 1
+                check_message(msg)
 
 
-        if pp_rank == args.target_pipeline_parallel_size - 1:
-            msg = queue_get("final norm")
-            final_norm_weight = msg.pop("weight")
-            if md.norm_has_bias:
-                final_norm_bias = msg.pop("bias")
-            pp_local_models = [get_local_model(pp_rank, ep_rank, tp_rank) for ep_rank in range(args.target_expert_parallel_size)
-                for tp_rank in range(args.target_tensor_parallel_size)]
-            for eptp_rank, model in enumerate(pp_local_models):
-                tp_rank = eptp_rank % args.target_tensor_parallel_size
-                setter.set_final_norm(
-                    model,
-                    weight=final_norm_weight,
-                    bias=final_norm_bias if md.norm_has_bias else None,
-                )
-                if pp_rank != 0 and not md.output_layer:
-                    # Copy word embeddings to final pipeline rank
-                    setter.set_output_word_embeddings(
-                        model,
-                        emb=out_word_embed[tp_rank],
-                    )
-            del final_norm_weight
-            if md.norm_has_bias:
-                del final_norm_bias
-            check_message(msg)
-
-            if md.output_layer:
-                msg = queue_get("output layer")
-                if not hasattr(pp_local_models[0], 'output_layer'):
-                    print("ERROR: got an output layer, but model does not have one")
-                    exit(1)
-                output_layer_weight = pad_weight(msg.pop("weight"), md.true_vocab_size)
-                output_layer_weight = torch.chunk(output_layer_weight, args.target_tensor_parallel_size, dim=0)
+            if pp_rank == args.target_pipeline_parallel_size - 1 and vp_rank == args.target_virtual_pipeline_parallel_size - 1:
+                print(f"handling output layer for pp {pp_rank} vp {vp_rank} ...")
+                msg = queue_get("final norm")
+                final_norm_weight = msg.pop("weight")
+                if md.norm_has_bias:
+                    final_norm_bias = msg.pop("bias")
+                pp_local_models = [
+                        get_local_model(pp_rank, ep_rank, tp_rank)
+                        for ep_rank in range(args.target_expert_parallel_size)
+                        for tp_rank in range(args.target_tensor_parallel_size)
+                    ]
                 for eptp_rank, model in enumerate(pp_local_models):
                     tp_rank = eptp_rank % args.target_tensor_parallel_size
-                    setter.set_output_layer(model, output_layer_weight[tp_rank])
-                check_message(msg)
-
-            msg = queue_get()
-            if msg != "done" and msg["name"] == "pooler":
-                if not hasattr(models[pp_rank][0][0], 'pooler'):
-                    print("ERROR: got a pooler, but model does not have one")
-                    exit(1)
-                print("received pooler")
-                pooler_weight = msg.pop("weight")
-                pooler_bias = msg.pop("bias")
-                for model in pp_local_models:
-                    setter.set_pooler(
-                        model=model,
-                        weight=pooler_weight,
-                        bias=pooler_bias,
+                    setter.set_final_norm(
+                        model[-1],
+                        weight=final_norm_weight,
+                        bias=final_norm_bias if md.norm_has_bias else None,
                     )
-                del pooler_weight
-                del pooler_bias
-                check_message(msg)
-                msg = queue_get()
-
-            if msg != "done" and msg["name"] == "lm head":
-                if not hasattr(models[pp_rank][0][0], 'lm_head'):
-                    print("ERROR: got an lm head, but model does not have one")
-                    exit(1)
-                print("received lm head")
-                lm_head_dense_weight = msg.pop("dense weight")
-                lm_head_dense_bias = msg.pop("dense bias")
-                lm_head_norm_weight = msg.pop("norm weight")
+                    if pp_rank != 0 and not md.output_layer:
+                        # Copy word embeddings to final pipeline rank
+                        setter.set_output_word_embeddings(
+                            model[-1],
+                            emb=out_word_embed[tp_rank],
+                        )
+                del final_norm_weight
                 if md.norm_has_bias:
-                    lm_head_norm_bias = msg.pop("norm bias")
-                for model in pp_local_models:
-                    setter.set_lm_head(
-                        model=model,
-                        dense_weight=lm_head_dense_weight,
-                        dense_bias=lm_head_dense_bias,
-                        norm_weight=lm_head_norm_weight,
-                        norm_bias=lm_head_norm_bias if md.norm_has_bias else None,
-                    )
+                    del final_norm_bias
                 check_message(msg)
-                msg = queue_get()
 
-            if msg != "done" and msg["name"] == "binary head":
-                if not hasattr(models[pp_rank][0][0], 'binary_head'):
-                    print("ERROR: got a binary head, but model does not have one")
-                    exit(1)
-                print("received binary head")
-                binary_head_weight = msg.pop("weight")
-                binary_head_bias = msg.pop("bias")
-                for model in pp_local_models:
-                    setter.set_binary_head(
-                        model=model,
-                        weight=binary_head_weight,
-                        bias=binary_head_bias,
-                    )
-                check_message(msg)
-                msg = queue_get()
+                if md.output_layer:
+                    msg = queue_get("output layer")
+                    if not hasattr(pp_local_models[0][-1], 'output_layer'):
+                        print("ERROR: got an output layer, but model does not have one")
+                        exit(1)
+                    output_layer_weight = pad_weight(msg.pop("weight"), md.true_vocab_size)
+                    output_layer_weight = torch.chunk(output_layer_weight, args.target_tensor_parallel_size, dim=0)
+                    for eptp_rank, model in enumerate(pp_local_models):
+                        tp_rank = eptp_rank % args.target_tensor_parallel_size
+                        setter.set_output_layer(model[-1], output_layer_weight[tp_rank])
+                    check_message(msg)
 
-            # TODO: delete weight when not used
-            if msg != "done":
-                print("ERROR: got some more data but was expecting to be done")
+                msg = queue_get()
+                if msg != "done" and msg["name"] == "pooler":
+                    if not hasattr(models[pp_rank][0][0][-1], 'pooler'):
+                        print("ERROR: got a pooler, but model does not have one")
+                        exit(1)
+                    print("received pooler")
+                    pooler_weight = msg.pop("weight")
+                    pooler_bias = msg.pop("bias")
+                    for model in pp_local_models:
+                        setter.set_pooler(
+                            model=model[-1],
+                            weight=pooler_weight,
+                            bias=pooler_bias,
+                        )
+                    del pooler_weight
+                    del pooler_bias
+                    check_message(msg)
+                    msg = queue_get()
+
+                if msg != "done" and msg["name"] == "lm head":
+                    if not hasattr(models[pp_rank][0][0][-1], 'lm_head'):
+                        print("ERROR: got an lm head, but model does not have one")
+                        exit(1)
+                    print("received lm head")
+                    lm_head_dense_weight = msg.pop("dense weight")
+                    lm_head_dense_bias = msg.pop("dense bias")
+                    lm_head_norm_weight = msg.pop("norm weight")
+                    if md.norm_has_bias:
+                        lm_head_norm_bias = msg.pop("norm bias")
+                    for model in pp_local_models:
+                        setter.set_lm_head(
+                            model=model[-1],
+                            dense_weight=lm_head_dense_weight,
+                            dense_bias=lm_head_dense_bias,
+                            norm_weight=lm_head_norm_weight,
+                            norm_bias=lm_head_norm_bias if md.norm_has_bias else None,
+                        )
+                    check_message(msg)
+                    msg = queue_get()
+
+                if msg != "done" and msg["name"] == "binary head":
+                    if not hasattr(models[pp_rank][0][0][-1], 'binary_head'):
+                        print("ERROR: got a binary head, but model does not have one")
+                        exit(1)
+                    print("received binary head")
+                    binary_head_weight = msg.pop("weight")
+                    binary_head_bias = msg.pop("bias")
+                    for model in pp_local_models:
+                        setter.set_binary_head(
+                            model=model[-1],
+                            weight=binary_head_weight,
+                            bias=binary_head_bias,
+                        )
+                    check_message(msg)
+                    msg = queue_get()
+
+                # TODO: delete weight when not used
+                if msg != "done":
+                    print("ERROR: got some more data but was expecting to be done")
 
         for ep_rank in range(args.target_expert_parallel_size):
             for tp_rank in range(args.target_tensor_parallel_size):
-                save_checkpoint(md.iteration, [get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
+                print(f"save checkpoint for pp {pp_rank} ep {ep_rank} tp {tp_rank}")
+                save_checkpoint(md.iteration, get_local_model(pp_rank, ep_rank, tp_rank), None, None, num_floating_point_operations_so_far=0,
                     pipeline_rank=pp_rank, pipeline_parallel=args.target_pipeline_parallel_size > 1,
                     expert_rank=ep_rank, expert_parallel=args.target_expert_parallel_size > 1,
                     tensor_rank=tp_rank)
-                # release the uselese model parts
-                models[pp_rank][ep_rank][tp_rank] = None
+                # release the useless model parts
+                for vp_rank in range(args.target_virtual_pipeline_parallel_size):
+                    models[pp_rank][ep_rank][tp_rank][vp_rank] = None
 
     print("Done!")
